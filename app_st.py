@@ -1,14 +1,12 @@
-import streamlit as st
+import re
 import requests
 from bs4 import BeautifulSoup
+import matplotlib.pyplot as plt
+from datetime import datetime
+from matplotlib.dates import DateFormatter, DayLocator
+import streamlit as st
 import psycopg2
 from transformers import pipeline, AutoTokenizer
-import re
-import time
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 import io
 
 # PostgreSQL database credentials
@@ -17,10 +15,82 @@ DB_NAME = 'amazon2'
 DB_USER = 'amazon2'
 DB_PASSWORD = 'amazon2'
 
+# Sentiment Analysis Pipeline
 sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
 tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased-finetuned-sst-2-english")
 
-# Function to scrape product details from Amazon URL
+def convert_amazon_to_buyhatke(amazon_url):
+    asin_match = re.search(r'/dp/([A-Z0-9]{10})', amazon_url)
+    if asin_match:
+        asin = asin_match.group(1)
+        buyhatke_url = f"https://buyhatke.com/api/productData?pos=6326&pid={asin}"
+        return buyhatke_url
+    else:
+        raise ValueError("Invalid Amazon URL or ASIN not found.")
+
+def get_internal_pid(api_url):
+    try:
+        response = requests.get(api_url)
+        response.raise_for_status()
+        data = response.json()
+        internal_pid = data['data']['internalPid']
+        return internal_pid
+    except requests.exceptions.RequestException as e:
+        st.error(f"Request failed: {e}")
+    except KeyError:
+        st.error("Key 'internalPid' not found in the response.")
+    except ValueError:
+        st.error("Failed to decode JSON response.")
+
+def create_custom_url(internal_pid):
+    return f"https://buyhatke.com/amazon-com-price-in-india-6326-{internal_pid}"
+
+def scrape_data_from_custom_url(custom_url):
+    try:
+        response = requests.get(custom_url)
+        response.raise_for_status()
+        html_content = response.text
+        soup = BeautifulSoup(html_content, 'html.parser')
+        script_tag = soup.find('script', string=re.compile('predictedData'))
+
+        if script_tag:
+            script_content = script_tag.string
+            match = re.search(r'predictedData:(".*?")', script_content)
+            if match:
+                predicted_data = match.group(1).strip('"')
+                cleaned_data = predicted_data.replace('~*~*', '~').replace('~*', '~')
+                entries = cleaned_data.split('~')
+                dates = []
+                prices = []
+                i = 0
+                while i < len(entries) - 1:
+                    date_entry = entries[i].strip()
+                    price_entry = entries[i + 1].strip()
+                    if re.match(r'\d{4}-\d{2}-\d{2}', date_entry) and re.match(r'\d+\.\d+', price_entry):
+                        dates.append(datetime.strptime(date_entry, '%Y-%m-%d %H:%M:%S'))
+                        prices.append(float(price_entry))
+                    i += 2
+                return dates, prices
+            else:
+                st.error("Predicted data not found")
+        else:
+            st.error("Script tag with predictedData not found")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Request failed: {e}")
+
+def plot_price_history(dates, prices):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(dates, prices, marker='o', linestyle='-', color='b')
+    ax.set_title('Price History')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Price')
+    ax.grid(True)
+    plt.xticks(rotation=45)
+    ax.xaxis.set_major_locator(DayLocator())
+    ax.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d'))
+    plt.tight_layout()
+    return fig
+
 def scrape_product_details(url):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:66.0) Gecko/20100101 Firefox/66.0",
@@ -43,12 +113,8 @@ def scrape_product_details(url):
 
         price_elem = soup.find("span", class_='a-offscreen')
         price = price_elem.get_text().strip() if price_elem else "NA"
-
-        if price != "NA":
-            price = re.sub(r'[^\d.]', '', price)
-            price = float(price)
-        else:
-            price = 0
+        price = re.sub(r'[^\d.]', '', price) if price != "NA" else "0"
+        price = float(price)
 
         reviews_count_elem = soup.find("span", attrs={'id': 'acrCustomerReviewText'})
         reviews_count = reviews_count_elem.get_text().strip().replace(',', '') if reviews_count_elem else "NA"
@@ -59,12 +125,7 @@ def scrape_product_details(url):
         description_elem = soup.find("div", attrs={'id': 'productDescription'})
         description = description_elem.find("p").get_text().strip().replace(',', '') if description_elem and description_elem.find("p") else "NA"
 
-        images = []
-        img_tags = soup.find_all("div", class_="imgTagWrapper")
-        for tag in img_tags:
-            img = tag.find("img")
-            if img and img.has_attr("src"):
-                images.append(img["src"])
+        images = [img["src"] for tag in soup.find_all("div", class_="imgTagWrapper") for img in [tag.find("img")] if img and img.has_attr("src")]
 
         seller_elem = soup.find("a", attrs={'id': 'sellerProfileTriggerId'})
         seller = seller_elem.get_text().strip().replace(',', '') if seller_elem else "Amazon"
@@ -72,20 +133,12 @@ def scrape_product_details(url):
         accordion_caption_elem = soup.find("div", class_="a-row accordion-caption")
         used_price_elem = accordion_caption_elem.find_next("span", class_="a-offscreen") if accordion_caption_elem else None
         used_price = used_price_elem.get_text().strip() if used_price_elem else "NA"
+        used_price = re.sub(r'[^\d.]', '', used_price) if used_price != "NA" else "0"
+        used_price = float(used_price)
 
-        if used_price != "NA":
-            used_price = re.sub(r'[^\d.]', '', used_price)
-            used_price = float(used_price)
-        else:
-            used_price = 0
-        
         used_condition_elem = soup.find("div", class_="a-row accordion-caption").find_next("span", class_="a-text-bold") if soup.find("div", class_="a-row accordion-caption") else None
         used_condition = used_condition_elem.get_text().strip() if used_condition_elem else "NA"
-
-        if used_condition != "NA":
-            parts = used_condition.split('-')
-            if len(parts) > 1:
-                used_condition = parts[1].strip()
+        used_condition = used_condition.split('-')[1].strip() if used_condition != "NA" and len(used_condition.split('-')) > 1 else "NA"
 
         discount = round(((price - used_price) / price * 100), 2) if price > 0 and used_price > 0 else 0
 
@@ -108,226 +161,165 @@ def scrape_product_details(url):
 
         other_sellers = []
         sellers_section = soup.find("div", id="aod-offer-list")
+
         if sellers_section:
             seller_entries = sellers_section.find_all("div", id="aod-offer")
+
             for entry in seller_entries:
                 seller_name_elem = entry.find("a", class_="a-size-small a-link-normal")
-                seller_name = seller_name_elem.get_text().strip() if seller_name_elem else "Unknown"
+                seller_name = seller_name_elem.get_text().strip() if seller_name_elem else "NA"
 
-                seller_price_elem = entry.find("span", class_="a-offscreen")
-                seller_price = seller_price_elem.get_text().strip().replace(',', '') if seller_price_elem else "NA"
-
-                seller_condition_elem = entry.find("div", id="aod-offer-heading")
-                seller_condition = seller_condition_elem.get_text().strip() if seller_condition_elem else "NA"
-
-                seller_shipping_elem = entry.find("span", class_="a-size-small a-color-base")
-                seller_shipping = seller_shipping_elem.get_text().strip().replace(',', '') if seller_shipping_elem else "Free"
+                seller_price_elem = entry.find("span", class_="a-price-whole")
+                seller_price = seller_price_elem.get_text().strip() if seller_price_elem else "NA"
+                seller_price = re.sub(r'[^\d.]', '', seller_price) if seller_price != "NA" else "0"
+                seller_price = float(seller_price)
 
                 other_sellers.append({
-                    "name": seller_name,
-                    "price": seller_price,
-                    "condition": seller_condition,
-                    "shipping": seller_shipping
+                    "seller_name": seller_name,
+                    "price": seller_price
                 })
 
         return {
-            "title": title,
-            "price": price,
-            "reviews_count": reviews_count,
-            "availability": availability,
-            "description": description,
-            "images": images,
-            "seller": seller,
-            "used_price": used_price,
-            "used_condition": used_condition,
-            "discount": discount,
-            "reviews": reviews,
-            "other_sellers": other_sellers
+            'title': title,
+            'price': price,
+            'reviews_count': reviews_count,
+            'availability': availability,
+            'description': description,
+            'discount': discount,
+            'used_price': used_price,
+            'used_condition': used_condition,
+            'images': images,
+            'seller': seller,
+            'reviews': reviews,
+            'other_sellers': other_sellers
         }
 
     except requests.exceptions.RequestException as e:
-        st.error(f"Error fetching {url}: {e}")
-        return None
+        st.error(f"Request failed: {e}")
 
-# Function to predict return rate based on reviews
 def predict_return_rate(reviews):
-    max_length = 512
+    max_length = 512  # Maximum length for the model
+
     truncated_reviews = []
     for review in reviews:
         review_text = review["text"]
+        # Tokenize and truncate the review text
         tokens = tokenizer.encode(review_text, max_length=max_length, truncation=True)
         truncated_review = tokenizer.decode(tokens, skip_special_tokens=True)
-        truncated_reviews.append(truncated_review)
+        truncated_reviews.append(truncated_review)  
 
     sentiments = sentiment_pipeline(truncated_reviews)
     positive_count = sum(1 for sentiment in sentiments if sentiment['label'] == 'POSITIVE')
     return_rate = (len(truncated_reviews) - positive_count) / len(truncated_reviews) * 100 if truncated_reviews else 0
     return round(return_rate, 2)
 
-# Function to save product details to PostgreSQL database
-def save_to_database(data):
-    images_array = '{' + ','.join(f'"{img}"' for img in data['images']) + '}'
+def save_to_postgresql(data):
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD
+        )
+        cursor = conn.cursor()
 
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD
-    )
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO products (title, price, reviews_count, availability, description, images, seller, used_price, used_condition, discount)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (data['title'], data['price'], data['reviews_count'], data['availability'], data['description'], images_array, data['seller'], data['used_price'], data['used_condition'], data['discount']))
-    conn.commit()
-    cursor.close()
-    conn.close()
+        cursor.execute("""
+        INSERT INTO product_details (title, price, reviews_count, availability, description, discount, used_price, used_condition)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (data['title'], data['price'], data['reviews_count'], data['availability'],
+              data['description'], data['discount'], data['used_price'], data['used_condition']))
 
-def product_exists(title):
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD
-    )
-    cursor = conn.cursor()
-    cursor.execute("SELECT price FROM products WHERE title = %s", (title,))
-    result = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return result
+        conn.commit()
 
-# Function to generate random price history
-def generate_price_history(start_year=2020, end_year=2024, base_price=100):
-    years = list(range(start_year, end_year + 1))
-    prices = []
+        for img_url in data['images']:
+            cursor.execute("""
+            INSERT INTO product_images (product_title, image_url)
+            VALUES (%s, %s)
+            """, (data['title'], img_url))
 
-    for year in years:
-        yearly_price = base_price * (1 + np.random.uniform(-0.1, 0.1))
-        prices.append(yearly_price)
-        base_price = yearly_price
+        for review in data['reviews']:
+            cursor.execute("""
+            INSERT INTO product_reviews (product_title, review_title, review_rating, review_text, review_author, review_date)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """, (data['title'], review['title'], review['rating'], review['text'],
+                  review['author'], review['date']))
 
-    price_history = pd.DataFrame({
-        'Year': years,
-        'Price': prices
-    })
+        for seller in data['other_sellers']:
+            cursor.execute("""
+            INSERT INTO other_sellers (product_title, seller_name, price)
+            VALUES (%s, %s, %s)
+            """, (data['title'], seller['seller_name'], seller['price']))
 
-    return price_history
+        conn.commit()
+        cursor.close()
+        conn.close()
 
-# Function to plot price history
-def plot_price_history(price_history):
-    plt.figure(figsize=(10, 6))
-    sns.lineplot(data=price_history, x='Year', y='Price', marker='o')
-    plt.title('Price History Over the Years')
-    plt.xlabel('Year')
-    plt.ylabel('Price')
-    plt.grid(True)
-    plt.tight_layout()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
-    return buf
+    except psycopg2.Error as e:
+        st.error(f"Database error: {e}")
 
-# Streamlit application
 def main():
-    st.title("Amazon Product Scraper")
+    st.sidebar.title('Navigation')
+    page = st.sidebar.radio('Select a Page', ['Home', 'Scrape Product'])
 
-    pages = ["Home", "Scrape Product"]
-    page = st.sidebar.selectbox("Select a Page", pages)
+    if page == 'Home':
+        st.title('Welcome to the Amazon Scraper App')
+        st.write("This app allows you to scrape product details from Amazon and visualize price history from Buyhatke.")
 
-    if page == "Home":
-        st.write("Welcome to the Amazon Product Scraper app!")
-        st.write("Use the sidebar to navigate to the 'Scrape Product' page.")
+    elif page == 'Scrape Product':
+        st.title('Scrape Amazon Product Details')
 
-    elif page == "Scrape Product":
-        st.title("Scrape Amazon Product Details")
+        amazon_url = st.text_input("Enter Amazon Product URL")
+        if st.button('Scrape'):
+            if amazon_url:
+                try:
+                    buyhatke_url = convert_amazon_to_buyhatke(amazon_url)
+                    internal_pid = get_internal_pid(buyhatke_url)
+                    custom_url = create_custom_url(internal_pid)
+                    dates, prices = scrape_data_from_custom_url(custom_url)
 
-        url = st.text_input("Enter Amazon Product URL")
-        if st.button("Scrape Product Details"):
-            if url:
-                loading_placeholder = st.empty()
-                loading_html = """
-                        <div style="display: flex; justify-content: center; align-items: center; flex-direction: column; height: 50vh;">
-                            <img src="https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExMGJoOTNkOGF2NzRweHlsNnIxZWJ5dXRhYW8xbWQ3bGdjOXdmbXp1YyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/l0Iy6QHeT2PENtdEQ/giphy.webp" alt="Loading..." style="width: 200px; height: 200px;" />
-                            <p style="font-size: 20px; margin-top: 10px;">Scraping product details...</p>
-                        </div>
-                        """
-                loading_placeholder.markdown(loading_html, unsafe_allow_html=True)
+                    if dates and prices:
+                        fig = plot_price_history(dates, prices)
+                        st.pyplot(fig)
 
-                data = scrape_product_details(url)
-                loading_placeholder.empty()
-                if data:
-                    existing_product = product_exists(data['title'])
+                    data = scrape_product_details(amazon_url)
+                    if data:
+                        save_to_postgresql(data)
+                        st.success("Product details saved to database.")
 
-                    if existing_product:
-                        st.write("### Product Already Exists in Database")
-                        previous_price_str = existing_product[0]
-                        try:
-                            previous_price = float(previous_price_str)
-                            st.write(f"**Previous Price:** {previous_price:.2f}")
-                        except ValueError:
-                            st.write("**Previous Price:** Data error")
+                        st.subheader("Product Details")
+                        st.write(f"**Title:** {data['title']}")
+                        st.write(f"**Price:** {data['price']}")
+                        st.write(f"**Reviews Count:** {data['reviews_count']}")
+                        st.write(f"**Availability:** {data['availability']}")
+                        st.write(f"**Description:** {data['description']}")
+                        st.write(f"**Discount:** {data['discount']}%")
+                        st.write(f"**Used Price:** {data['used_price']}")
+                        st.write(f"**Used Condition:** {data['used_condition']}")
+                        st.write("**Images:**")
+                        for img_url in data['images']:
+                            st.image(img_url, use_column_width=True)
 
-                    save_to_database(data)
-
-                    st.success("Product details scraped and saved successfully!")
-
-                    col1, col2 = st.columns([1, 2])
-
-                    with col1:
-                        st.write("### Product Images")
-                        for image_url in data['images']:
-                            st.image(image_url, use_column_width=True)
-
-                    with col2:
-                        st.write("### Product Title")
-                        st.write(data['title'])
-                        st.write("### Price")
-                        st.write(f"{data['price']:.2f}")
-                        st.write("### Used Price")
-                        st.write(f"{data['used_price']:.2f}")
-                        st.write("### Used Condition")
-                        st.write(data['used_condition'])
-                        st.write("### Discount")
-                        st.write(f"{data['discount']}%")
-                        st.write("### Reviews Count")
-                        st.write(data['reviews_count'])
-                        st.write("### Availability")
-                        st.write(data['availability'])
-                        st.write("### Description")
-                        st.write(data['description'])
-                        st.write("### Seller")
-                        st.write(data['seller'])
-
-                        if data['other_sellers']:
-                            st.write("### Other Sellers")
-                            for seller in data['other_sellers']:
-                                st.write(f"**Seller:** {seller['name']}")
-                                st.write(f"**Price:** {seller['price']}")
-                                st.write(f"**Condition:** {seller['condition']}")
-                                st.write(f"**Shipping:** {seller['shipping']}")
-                                st.write("---")
-                        
-                        st.write("### Return Rate")
+                        # Calculate return rate and display
                         return_rate = predict_return_rate(data['reviews'])
-                        st.write(f"{return_rate}%")
-                        st.progress(return_rate / 100)
-                        st.write("### Reviews")
+                        st.write(f"**Predicted Return Rate:** {return_rate:.2f}%")
+                        st.write(f"**Predicted Return Rate (Debug):** {return_rate:.2f}%")  # Debugging line
+
+                        st.subheader("Reviews")
                         for review in data['reviews']:
-                            st.write(f"**{review['title']}** ({review['rating']})")
-                            st.write(f"By {review['author']} on {review['date']}")
-                            st.write(review['text'])
+                            st.write(f"**{review['title']}**")
+                            st.write(f"Rating: {review['rating']}")
+                            st.write(f"Date: {review['date']}")
+                            st.write(f"Author: {review['author']}")
+                            st.write(f"Review: {review['text']}")
                             st.write("---")
 
-                    st.write("### Price History")
-                    price_history = generate_price_history()
-                    price_chart = plot_price_history(price_history)
-                    st.image(price_chart)
-                else:
-                    st.error("Error fetching product details. Please try again later.")
-        else:
-            st.warning("Please enter a valid Amazon product URL.")
+                        st.subheader("Other Sellers")
+                        for seller in data['other_sellers']:
+                            st.write(f"**Seller:** {seller['seller_name']}")
+                            st.write(f"Price: {seller['price']}")
+                            st.write("---")
+                except ValueError as e:
+                    st.error(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
